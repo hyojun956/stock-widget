@@ -1,0 +1,5 @@
+dist/
+__pycache__/
+stock_widget_config.json
+*.spec
+build/
