@@ -161,7 +161,11 @@ def install_update(info):
     except OSError:
         os.replace(old, exe)  # 실패하면 원래대로 되돌림
         raise
-    subprocess.Popen([exe, "--updated"], cwd=os.path.dirname(exe), close_fds=True)
+    # PyInstaller 내부 환경변수를 물려주면 새 exe가 이전 버전의 임시 폴더를 재사용하려 하므로 초기화
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("_PYI", "_MEI"))}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen([exe, "--updated"], cwd=os.path.dirname(exe), env=env, close_fds=True,
+                     creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
 
 
 def cleanup_old_exe():
@@ -296,6 +300,7 @@ class StockWidget:
         self.root.after(200, self.drain_queue)
         if FROZEN:
             cleanup_old_exe()
+            self.root.after(10000, cleanup_old_exe)  # 업데이트 직후엔 이전 프로세스가 종료될 때까지 잠겨 있을 수 있음
             self.root.after(3000, self.check_update)
         if "--updated" in sys.argv:
             self.clock.config(text=f"v{APP_VERSION} 업데이트 완료")
@@ -460,8 +465,9 @@ class StockWidget:
                 elif kind == "update":
                     self.on_update_result(*payload)
                 elif kind == "updated":
-                    self.quit()  # 새 exe가 이미 실행됨
-                    return
+                    # 새 exe가 이미 실행됨 → 설정 저장 후 확실히 종료 (남은 스레드가 있어도 대기하지 않음)
+                    self.save_config()
+                    os._exit(0)
                 elif kind == "update_fail":
                     self.update_bar.config(text="업데이트 실패 — 클릭해서 다시 시도", cursor="hand2")
                 else:

@@ -6,7 +6,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$Notes = "Update"
 )
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"  # native tools log to stderr; failures are checked via $LASTEXITCODE
 Set-Location $PSScriptRoot
 $repo = "hyojun956/stock-widget"
 $src = Join-Path $PSScriptRoot "stock_widget.pyw"
