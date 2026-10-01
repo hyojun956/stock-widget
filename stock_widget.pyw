@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_REPO = "hyojun956/stock-widget"   # 업데이트를 받아올 저장소 (release.ps1 로 배포)
 # API 대신 릴리스 첨부파일 직접 링크 사용 → 사무실 전체가 같은 IP여도 GitHub API 호출 제한(시간당 60회)에 안 걸림
 RELEASE_BASE = f"https://github.com/{GITHUB_REPO}/releases/latest/download/"
@@ -33,6 +33,8 @@ if FROZEN:
     CONFIG_PATH = os.path.join(_cfg_dir, "config.json")
 else:
     CONFIG_PATH = os.path.join(APP_DIR, "stock_widget_config.json")
+# exe 안에 묶인 파일은 PyInstaller 임시 폴더(sys._MEIPASS)에 풀림
+ICON_PATH = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "assets", "icon.ico")
 
 DEFAULT_CONFIG = {
     "x": 100,
@@ -242,7 +244,11 @@ class StockWidget:
         self.wake = threading.Event()
 
         self.root = tk.Tk()
-        self.root.title("주가 위젯")
+        self.root.title("GT Stock")
+        try:  # 편집 창 등 모든 창에 GT Stock 아이콘
+            self.root.iconbitmap(default=ICON_PATH)
+        except tk.TclError:
+            pass
         self.root.overrideredirect(True)
         self.root.configure(bg=BG)
         self.root.attributes("-topmost", self.cfg["topmost"])
@@ -689,6 +695,8 @@ if __name__ == "__main__":
     try:  # 고해상도 모니터에서 글자 선명하게
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        # 작업표시줄에서 python 아이콘 대신 GT Stock 아이콘으로 표시 (GT Task Manager와 같은 방식)
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GlobalTechnologies.GTStock.1")
     except Exception:
         pass
     StockWidget().run()

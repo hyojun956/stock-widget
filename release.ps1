@@ -19,8 +19,10 @@ $code = [regex]::Replace($code, 'APP_VERSION = "[^"]*"', "APP_VERSION = `"$Versi
 
 # 2) build exe
 $work = Join-Path $env:TEMP "stockwidget-build"
+$ico = Join-Path $PSScriptRoot "assets\icon.ico"
 python -m PyInstaller --onefile --noconsole --name StockWidget --distpath dist `
-    --workpath $work --specpath $work --noconfirm stock_widget.pyw
+    --workpath $work --specpath $work --noconfirm `
+    --icon $ico --add-data "$ico;assets" stock_widget.pyw
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
 # 3) version.json = what running widgets poll (asset URLs avoid GitHub API rate limits)
