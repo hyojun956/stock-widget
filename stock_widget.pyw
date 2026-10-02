@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 GITHUB_REPO = "hyojun956/stock-widget"   # 업데이트를 받아올 저장소 (release.ps1 로 배포)
 # API 대신 릴리스 첨부파일 직접 링크 사용 → 사무실 전체가 같은 IP여도 GitHub API 호출 제한(시간당 60회)에 안 걸림
 RELEASE_BASE = f"https://github.com/{GITHUB_REPO}/releases/latest/download/"
@@ -196,11 +196,14 @@ class StockRow:
                                font=(FONT, 8), anchor="w", width=20)
         self.change = tk.Label(self.frame, text="", bg=BG_ROW, fg=FLAT,
                                font=(FONT, 9, "bold"), anchor="e", width=17)
+        self.value = tk.Label(self.frame, text="거래대금 -", bg=BG_ROW, fg=FG_DIM,
+                              font=(FONT, 8), anchor="w", width=20)
         self.name.grid(row=0, column=0, sticky="w")
         self.price.grid(row=0, column=1, sticky="e")
         self.volume.grid(row=1, column=0, sticky="w")
         self.change.grid(row=1, column=1, sticky="e")
-        self.widgets = [self.frame, self.name, self.price, self.volume, self.change]
+        self.value.grid(row=2, column=0, sticky="w")
+        self.widgets = [self.frame, self.name, self.price, self.volume, self.change, self.value]
 
     def _set(self, label, **kw):
         if self._shown.get(label) != kw:
@@ -229,6 +232,8 @@ class StockRow:
         self._set(self.price, text=price, fg=color)
         self._set(self.change, text=f"{arrow} {diff}  {sign}{ratio}%", fg=color)
         self._set(self.volume, text=f'거래량 {d.get("accumulatedTradingVolume", "-")}')
+        # 네이버가 이미 읽기 쉬운 단위로 줌 — 국내 "2조 7,216억", 해외 "167억 USD"
+        self._set(self.value, text=f'거래대금 {d.get("accumulatedTradingValue") or "-"}')
 
     def bind_all(self, seq, fn):
         for w in self.widgets:
