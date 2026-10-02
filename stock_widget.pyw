@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 GITHUB_REPO = "hyojun956/stock-widget"   # 업데이트를 받아올 저장소 (release.ps1 로 배포)
 # API 대신 릴리스 첨부파일 직접 링크 사용 → 사무실 전체가 같은 IP여도 GitHub API 호출 제한(시간당 60회)에 안 걸림
 RELEASE_BASE = f"https://github.com/{GITHUB_REPO}/releases/latest/download/"
@@ -66,6 +66,18 @@ ALPHA_MIN = 0.3   # 너무 투명해서 안 보이는 것 방지
 # 네이버 compareToPreviousPrice.code: 1 상한, 2 상승, 3 보합, 4 하한, 5 하락
 UP_CODES = {"1", "2"}
 DOWN_CODES = {"4", "5"}
+
+
+def korean_money(raw):
+    """원 단위 금액 → '1,610조 6,497억' (억 미만 버림)."""
+    try:
+        eok = int(raw) // 10**8
+    except (TypeError, ValueError):
+        return ""
+    jo, eok = divmod(eok, 10**4)
+    if jo and eok:
+        return f"{jo:,}조 {eok:,}억"
+    return f"{jo:,}조" if jo else f"{eok:,}억"
 
 
 def set_if_changed(widget, **kw):
@@ -202,8 +214,11 @@ class StockRow:
         self.price.grid(row=0, column=1, sticky="e")
         self.volume.grid(row=1, column=0, sticky="w")
         self.change.grid(row=1, column=1, sticky="e")
+        self.mcap = tk.Label(self.frame, text="", bg=BG_ROW, fg=FG_DIM,
+                             font=(FONT, 8), anchor="e", width=22)
         self.value.grid(row=2, column=0, sticky="w")
-        self.widgets = [self.frame, self.name, self.price, self.volume, self.change, self.value]
+        self.mcap.grid(row=2, column=1, sticky="e")
+        self.widgets = [self.frame, self.name, self.price, self.volume, self.change, self.value, self.mcap]
 
     def _set(self, label, **kw):
         if self._shown.get(label) != kw:
@@ -234,6 +249,9 @@ class StockRow:
         self._set(self.volume, text=f'거래량 {d.get("accumulatedTradingVolume", "-")}')
         # 네이버가 이미 읽기 쉬운 단위로 줌 — 국내 "2조 7,216억", 해외 "167억 USD"
         self._set(self.value, text=f'거래대금 {d.get("accumulatedTradingValue") or "-"}')
+        # 시총: 해외는 "4조 8,207억 USD" 형태로 오고, 국내는 원 단위 숫자만 와서 직접 조/억으로 변환
+        mcap = d.get("marketValueHangeul") or korean_money(d.get("marketValueFullRaw"))
+        self._set(self.mcap, text=f"시총 {mcap}" if mcap else "")
 
     def bind_all(self, seq, fn):
         for w in self.widgets:
