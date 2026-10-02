@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 GITHUB_REPO = "hyojun956/stock-widget"   # 업데이트를 받아올 저장소 (release.ps1 로 배포)
 # API 대신 릴리스 첨부파일 직접 링크 사용 → 사무실 전체가 같은 IP여도 GitHub API 호출 제한(시간당 60회)에 안 걸림
 RELEASE_BASE = f"https://github.com/{GITHUB_REPO}/releases/latest/download/"
@@ -278,6 +278,7 @@ class StockWidget:
         self.root.attributes("-alpha", self.cfg["alpha"])
         self.root.geometry(f'+{self.cfg["x"]}+{self.cfg["y"]}')
         self.root.minsize(270, 0)
+        self.root.bind("<Map>", self.on_restore)
 
         self.outer = tk.Frame(self.root, bg=BG, padx=2, pady=2,
                               highlightthickness=1, highlightbackground="#2c3038")
@@ -294,10 +295,13 @@ class StockWidget:
         close_btn = tk.Label(self.header, text="✕", bg=BG, fg=FG_DIM, font=(FONT, 9), cursor="hand2")
         close_btn.pack(side="right", padx=(2, 6))
         close_btn.bind("<Button-1>", lambda e: self.quit())
+        min_btn = tk.Label(self.header, text="－", bg=BG, fg=FG_DIM, font=(FONT, 9), cursor="hand2")
+        min_btn.pack(side="right", padx=2)
+        min_btn.bind("<Button-1>", lambda e: self.minimize())
         add_btn = tk.Label(self.header, text="＋", bg=BG, fg=FG_DIM, font=(FONT, 9), cursor="hand2")
         add_btn.pack(side="right", padx=2)
         add_btn.bind("<Button-1>", lambda e: self.open_editor())
-        for b in (close_btn, add_btn):
+        for b in (close_btn, min_btn, add_btn):
             b.bind("<Enter>", lambda e, w=b: w.config(fg=FG))
             b.bind("<Leave>", lambda e, w=b: w.config(fg=FG_DIM))
 
@@ -552,6 +556,17 @@ class StockWidget:
                 json.dump(self.cfg, f, ensure_ascii=False, indent=2)
         except OSError:
             pass
+
+    def minimize(self):
+        """overrideredirect 창은 작업표시줄 항목이 없어 기본 iconify가 깨지므로,
+        최소화 직전에 잠깐 해제했다가 복구(<Map>) 시 다시 걸어준다."""
+        self.save_config()
+        self.root.overrideredirect(False)
+        self.root.iconify()
+
+    def on_restore(self, e):
+        if e.widget is self.root and self.root.state() == "normal":
+            self.root.overrideredirect(True)
 
     def quit(self):
         self.save_config()
