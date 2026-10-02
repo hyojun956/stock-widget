@@ -13,12 +13,13 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import urllib.parse
 import urllib.request
 from datetime import datetime
 
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 GITHUB_REPO = "hyojun956/stock-widget"   # 업데이트를 받아올 저장소 (release.ps1 로 배포)
 # API 대신 릴리스 첨부파일 직접 링크 사용 → 사무실 전체가 같은 IP여도 GitHub API 호출 제한(시간당 60회)에 안 걸림
 RELEASE_BASE = f"https://github.com/{GITHUB_REPO}/releases/latest/download/"
@@ -45,13 +46,15 @@ DEFAULT_CONFIG = {
     "win_w": None,   # 수동으로 크기 조절하면 채워짐 (None이면 자동 맞춤)
     "win_h": None,
     "stocks": [
-        {"code": "005930", "type": "domestic", "name": "삼성전자"},
+        {"code": "486510", "type": "domestic", "name": "글로벌테크놀로지"},
     ],
 }
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 REALTIME_URL = "https://polling.finance.naver.com/api/realtime/{type}/stock/{codes}"
 SEARCH_URL = "https://ac.stock.naver.com/ac?q={q}&target=stock,worldstock"
+CHART_URL = "https://api.stock.naver.com/chart/{market}/item/{code}"
+ORDERBOOK_URL = "https://m.stock.naver.com/api/stock/{code}/askingPrice"
 
 # 색상 (다크 테마)
 BG = "#16181d"
@@ -63,6 +66,8 @@ DOWN = "#4d8dff"    # 하락: 파랑
 FLAT = "#b0b4ba"    # 보합
 FONT = "Malgun Gothic"
 SLIDER_W = 64
+EDGE = 6          # 창 테두리에서 이 픽셀 안쪽을 잡으면 크기 조절
+MIN_W, MIN_H = 270, 30
 ALPHA_MIN = 0.3   # 너무 투명해서 안 보이는 것 방지
 
 # 네이버 compareToPreviousPrice.code: 1 상한, 2 상승, 3 보합, 4 하한, 5 하락
@@ -87,6 +92,32 @@ def set_if_changed(widget, **kw):
     diff = {k: v for k, v in kw.items() if str(widget.cget(k)) != str(v)}
     if diff:
         widget.config(**diff)
+
+
+def to_num(v):
+    try:
+        return float(str(v).replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def mix(c1, c2, t):
+    """두 #rrggbb 색을 t(0~1) 비율로 섞음 (Tk 캔버스는 반투명이 없어서 어두운 채움색을 만들 때 사용)."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+
+def dark_titlebar(window):
+    """Windows 10/11 제목 표시줄을 다크 모드로 (편집 창·차트 창이 흰 제목줄로 튀지 않게)."""
+    try:
+        import ctypes
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
+        on = ctypes.c_int(1)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(on), ctypes.sizeof(on))
+    except Exception:
+        pass
 
 
 def set_crisp_icon(window, path=ICON_PATH):
@@ -147,6 +178,23 @@ def search_stocks(query):
             out.append({"code": it["reutersCode"], "type": "worldstock", "name": it["name"],
                         "label": f'{it["name"]}  ({it["code"]} · {it.get("nationName", "")})'})
     return out
+
+
+def fetch_chart(stock, mode):
+    """[(라벨, 시가, 고가, 저가, 종가, 거래량)] — mode: "minute"(당일 1분) / "day"(일봉)."""
+    market = "domestic" if stock["type"] == "domestic" else "foreign"
+    url = CHART_URL.format(market=market, code=urllib.parse.quote(stock["code"]))
+    if mode == "minute":
+        rows = http_json(url + "/minute", timeout=8)
+        return [(r["localDateTime"][8:10] + ":" + r["localDateTime"][10:12], r["openPrice"], r["highPrice"],
+                 r["lowPrice"], r["currentPrice"], r.get("accumulatedTradingVolume") or 0) for r in rows]
+    rows = http_json(url + "?periodType=dayCandle", timeout=8).get("priceInfos", [])
+    return [(f'{r["localDate"][4:6]}/{r["localDate"][6:8]}', r["openPrice"], r["highPrice"],
+             r["lowPrice"], r["closePrice"], r.get("accumulatedTradingVolume") or 0) for r in rows]
+
+
+def fetch_orderbook(code):
+    return http_json(ORDERBOOK_URL.format(code=code), timeout=5)
 
 
 def load_config():
@@ -215,6 +263,44 @@ def cleanup_old_exe():
 
 
 # ---------------------------------------------------------------- UI
+class DarkScrollbar(tk.Canvas):
+    """기본 tk.Scrollbar는 Windows 테마라 흰색으로 나오고 색을 바꿀 수 없어서 직접 그린 얇은 스크롤바."""
+
+    def __init__(self, master, command, width=8):
+        super().__init__(master, width=width, bg=BG, highlightthickness=0, bd=0)
+        self.command = command
+        self.first, self.last = 0.0, 1.0
+        self._grab = 0
+        self.thumb = self.create_rectangle(0, 0, 0, 0, fill="#3a3f48", outline="")
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", lambda e: "break")
+        self.bind("<Enter>", lambda e: self.itemconfig(self.thumb, fill="#5a606c"))
+        self.bind("<Leave>", lambda e: self.itemconfig(self.thumb, fill="#3a3f48"))
+
+    def set(self, first, last):
+        self.first, self.last = float(first), float(last)
+        self._draw()
+
+    def _draw(self):
+        h, w = self.winfo_height(), self.winfo_width()
+        y0 = self.first * h
+        y1 = max(self.last * h, y0 + 16)
+        self.coords(self.thumb, 2, y0, w - 2, min(y1, h))
+
+    def _press(self, e):
+        h = max(self.winfo_height(), 1)
+        y0, y1 = self.first * h, self.last * h
+        self._grab = e.y - y0 if y0 <= e.y <= y1 else (y1 - y0) / 2
+        self._drag(e)
+        return "break"  # 스크롤바를 잡아도 창이 움직이지 않게
+
+    def _drag(self, e):
+        self.command("moveto", (e.y - self._grab) / max(self.winfo_height(), 1))
+        return "break"
+
+
 class StockRow:
     def __init__(self, parent, stock):
         self.stock = stock
@@ -243,6 +329,8 @@ class StockRow:
         self.value.grid(row=2, column=0, sticky="w")
         self.mcap.grid(row=2, column=1, sticky="e")
         self.widgets = [self.frame, self.name, self.price, self.volume, self.change, self.value, self.mcap]
+        for w in self.widgets:
+            w.config(cursor="hand2")  # 클릭하면 차트·호가 창
 
     def _set(self, label, **kw):
         if self._shown.get(label) != kw:
@@ -345,7 +433,7 @@ class StockWidget:
         self.body_area.pack(fill="both", expand=True)
         self.body_canvas = tk.Canvas(self.body_area, bg=BG, highlightthickness=0, width=270)
         self.body_canvas.pack(side="left", fill="both", expand=True)
-        self.body_scroll = tk.Scrollbar(self.body_area, orient="vertical", command=self.body_canvas.yview)
+        self.body_scroll = DarkScrollbar(self.body_area, command=self.body_canvas.yview)
         self.body = tk.Frame(self.body_canvas, bg=BG)
         self._body_window = self.body_canvas.create_window((0, 0), window=self.body, anchor="nw")
         self.body_canvas.configure(yscrollcommand=self.body_scroll.set)
@@ -354,14 +442,12 @@ class StockWidget:
         self.body_canvas.bind("<MouseWheel>", self._on_wheel)
         self.body.bind("<MouseWheel>", self._on_wheel)
 
-        # 오른쪽 아래 크기 조절 손잡이
-        self.grip = tk.Label(self.outer, text="⋰", bg=BG, fg=FG_DIM, font=(FONT, 10), cursor="size_nw_se")
-        self.grip.place(relx=1.0, rely=1.0, anchor="se", x=-1, y=-1)
-        self.grip.bind("<ButtonPress-1>", self.grip_start)
-        self.grip.bind("<B1-Motion>", self.grip_drag)
-        self.grip.bind("<ButtonRelease-1>", self.grip_end)
-        self.grip.bind("<Enter>", lambda e: self.grip.config(fg=FG))
-        self.grip.bind("<Leave>", lambda e: self.grip.config(fg=FG_DIM))
+        # 창 테두리 어디서든 크기 조절: 마우스가 가장자리 근처면 커서를 바꾸고, 누르면 이동 대신 크기 조절
+        self._rz = None
+        self._press_at = None
+        self._cursor_widget = None
+        self.root.bind_all("<Motion>", self._edge_motion, add="+")
+        self._details = {}
 
         for w in (self.outer, self.header, self.dot, self.clock, self.body, self.body_canvas):
             self._bind_common(w)
@@ -387,15 +473,72 @@ class StockWidget:
     def _bind_common(self, w):
         w.bind("<ButtonPress-1>", self.start_drag)
         w.bind("<B1-Motion>", self.on_drag)
-        w.bind("<ButtonRelease-1>", lambda e: self.save_config())
+        w.bind("<ButtonRelease-1>", self.end_drag)
         w.bind("<Button-3>", self.show_menu)
 
     def start_drag(self, e):
+        self._press_at = (e.x_root, e.y_root)
+        zone = self._edge_zone(e)
+        if zone:
+            self._rz = (zone, e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y(),
+                        self.body_canvas.winfo_width(), self.body_canvas.winfo_height())
+            return
+        self._rz = None
         self._dx = e.x_root - self.root.winfo_x()
         self._dy = e.y_root - self.root.winfo_y()
 
     def on_drag(self, e):
+        if self._rz:
+            self._resize_drag(e)
+            return
         self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+
+    def end_drag(self, e):
+        self._rz = None
+        self.save_config()
+
+    def _edge_zone(self, e):
+        """마우스가 창 가장자리 EDGE px 안이면 'n','se' 같은 방향 문자열, 아니면 ''."""
+        if e.widget.winfo_toplevel() is not self.root:
+            return ""
+        x, y = e.x_root - self.root.winfo_rootx(), e.y_root - self.root.winfo_rooty()
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        return (("n" if y < EDGE else "s" if y >= h - EDGE else "") +
+                ("w" if x < EDGE else "e" if x >= w - EDGE else ""))
+
+    def _edge_motion(self, e):
+        if self._rz or not isinstance(e.widget, tk.Misc):
+            return
+        zone = self._edge_zone(e)
+        cursor = {"n": "size_ns", "s": "size_ns", "w": "size_we", "e": "size_we",
+                  "nw": "size_nw_se", "se": "size_nw_se", "ne": "size_ne_sw", "sw": "size_ne_sw"}.get(zone)
+        prev = self._cursor_widget
+        if prev and (prev[0] is not e.widget or not cursor):
+            try:
+                prev[0].config(cursor=prev[1])
+            except tk.TclError:
+                pass
+            self._cursor_widget = None
+        if cursor and not self._cursor_widget:
+            try:
+                self._cursor_widget = (e.widget, e.widget.cget("cursor"))
+                e.widget.config(cursor=cursor)
+            except tk.TclError:
+                self._cursor_widget = None
+
+    def _resize_drag(self, e):
+        zone, x0r, y0r, wx, wy, cw, ch = self._rz
+        dx, dy = e.x_root - x0r, e.y_root - y0r
+        w = cw + dx if "e" in zone else cw - dx if "w" in zone else cw
+        h = ch + dy if "s" in zone else ch - dy if "n" in zone else ch
+        w, h = max(MIN_W, w), max(MIN_H, h)
+        x = wx + (cw - w) if "w" in zone else wx   # 왼쪽/위쪽을 잡으면 반대편은 고정되도록 창 위치도 이동
+        y = wy + (ch - h) if "n" in zone else wy
+        self.cfg["win_w"], self.cfg["win_h"] = w, h
+        self.body_canvas.configure(width=w, height=h)
+        self.root.geometry(f"+{x}+{y}")
+        self.body.update_idletasks()
+        self._show_scrollbar(self.body.winfo_reqheight() > h + 1)
 
     def keep_on_screen(self):
         """모니터 연결이 바뀌어 창이 화면 밖에 있으면 주 모니터로 데려옴 (듀얼 모니터 지원)."""
@@ -514,23 +657,6 @@ class StockWidget:
         set_if_changed(self.body_canvas, height=canvas_h, width=canvas_w)
         self._show_scrollbar(content_h > canvas_h + 1)
 
-    def grip_start(self, e):
-        self._grip = (e.x_root, e.y_root, self.body_canvas.winfo_width(), self.body_canvas.winfo_height())
-
-    def grip_drag(self, e):
-        x0, y0, w0, h0 = self._grip
-        w = max(270, w0 + (e.x_root - x0))
-        h = max(30, h0 + (e.y_root - y0))
-        self.cfg["win_w"], self.cfg["win_h"] = w, h
-        self.body_canvas.configure(width=w, height=h)
-        self.body.update_idletasks()
-        self._show_scrollbar(self.body.winfo_reqheight() > h + 1)
-        return "break"
-
-    def grip_end(self, e):
-        self.save_config()
-        return "break"
-
     # ---- 종목 관리
     def build_rows(self):
         for r in self.rows:
@@ -551,12 +677,29 @@ class StockWidget:
             row = StockRow(self.body, s)
             row.bind_all("<ButtonPress-1>", self.start_drag)
             row.bind_all("<B1-Motion>", self.on_drag)
-            row.bind_all("<ButtonRelease-1>", lambda e: self.save_config())
+            row.bind_all("<ButtonRelease-1>", lambda e, st=s: self.row_release(e, st))
             row.bind_all("<Button-3>", self.show_menu)
             row.bind_all("<MouseWheel>", self._on_wheel)
             self.rows.append(row)
         self.relayout_body()
         self.wake.set()
+
+    def row_release(self, e, stock):
+        was_resize = bool(self._rz)
+        self.end_drag(e)
+        if was_resize or not self._press_at:
+            return
+        if abs(e.x_root - self._press_at[0]) < 4 and abs(e.y_root - self._press_at[1]) < 4:
+            self.open_detail(stock)
+
+    def open_detail(self, stock):
+        key = (stock["type"], stock["code"])
+        d = self._details.get(key)
+        if d and d.win.winfo_exists():
+            d.win.deiconify()
+            d.win.lift()
+            return
+        self._details[key] = DetailWindow(self, stock)
 
     def set_stocks(self, stocks):
         """편집 창에서 바뀐 목록을 바로 위젯에 반영."""
@@ -690,6 +833,7 @@ class EditDialog:
         self.win.attributes("-topmost", True)
         self.win.resizable(False, False)
         set_crisp_icon(self.win)
+        dark_titlebar(self.win)
         # 위젯 옆에 띄우기 (왼쪽 공간이 있으면 왼쪽, 아니면 오른쪽)
         mx, my = master.winfo_x(), master.winfo_y()
         sx = mx - 380 if mx - 380 > master.winfo_vrootx() else mx + master.winfo_width() + 8
@@ -827,6 +971,314 @@ class EditDialog:
         self.stocks.append({"code": item["code"], "type": item["type"], "name": item["name"]})
         self.apply(len(self.stocks) - 1)
         self.status.config(text=f"'{item['name']}' 추가됨")
+
+
+class DetailWindow:
+    """종목 클릭 시 뜨는 창: 실시간 차트(당일 1분 / 일봉) + 호가(국내). 2초마다 갱신."""
+    BOOK_W = 210
+    ROW_H = 24
+
+    def __init__(self, widget, stock):
+        self.widget, self.stock = widget, stock
+        self.domestic = stock["type"] == "domestic"
+        self.mode = "minute" if self.domestic else "day"   # 해외는 네이버가 분봉을 주지 않음
+        self.q = queue.Queue()
+        self.wake = threading.Event()
+        self.stop = threading.Event()
+        self.chart_due = True
+        self.quote, self.book, self.series = None, None, []
+        self.prev_close = None
+
+        master = widget.root
+        self.win = tk.Toplevel(master, bg=BG)
+        self.win.title(f'{stock.get("name", stock["code"])} · 차트/호가')
+        self.win.attributes("-topmost", True)
+        self.win.minsize(520, 320)
+        set_crisp_icon(self.win)
+        dark_titlebar(self.win)
+        w, h = (700, 400) if self.domestic else (560, 380)
+        mx, my = master.winfo_x(), master.winfo_y()
+        sx = mx - w - 12 if mx - w - 12 > master.winfo_vrootx() else mx + master.winfo_width() + 12
+        self.win.geometry(f"{w}x{h}+{sx}+{my}")
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self.win.bind("<Escape>", lambda e: self.close())
+
+        # ---- 상단: 종목명 / 현재가 / 등락 / 차트 기간 버튼
+        top = tk.Frame(self.win, bg=BG, padx=12, pady=8)
+        top.pack(fill="x")
+        self.title = tk.Label(top, text=stock.get("name", stock["code"]), bg=BG, fg=FG, font=(FONT, 12, "bold"))
+        self.title.pack(side="left")
+        self.price = tk.Label(top, text="-", bg=BG, fg=FLAT, font=(FONT, 16, "bold"))
+        self.price.pack(side="left", padx=(12, 6))
+        self.change = tk.Label(top, text="", bg=BG, fg=FLAT, font=(FONT, 10, "bold"))
+        self.change.pack(side="left")
+        self.mode_btns = {}
+        modes = [("day", "일봉")] + ([("minute", "당일")] if self.domestic else [])
+        for key, label in modes:
+            b = tk.Label(top, text=label, bg=BG_ROW, fg=FG_DIM, font=(FONT, 9), padx=10, pady=2, cursor="hand2")
+            b.pack(side="right", padx=(4, 0))
+            b.bind("<Button-1>", lambda e, k=key: self.set_mode(k))
+            self.mode_btns[key] = b
+        self._paint_mode_buttons()
+
+        # ---- 본문: 차트(왼쪽, 늘어남) + 호가(오른쪽, 고정 폭)
+        body = tk.Frame(self.win, bg=BG, padx=8)
+        body.pack(fill="both", expand=True)
+        if self.domestic:
+            self.book_cv = tk.Canvas(body, width=self.BOOK_W, bg=BG, highlightthickness=0)
+            self.book_cv.pack(side="right", fill="y", padx=(8, 0))
+            self.book_cv.bind("<Configure>", lambda e: self.draw_book())
+        self.chart = tk.Canvas(body, bg=BG_ROW, highlightthickness=0, cursor="crosshair")
+        self.chart.pack(side="left", fill="both", expand=True)
+        self.chart.bind("<Configure>", lambda e: self.draw_chart())
+        self.chart.bind("<Motion>", self.on_hover)
+        self.chart.bind("<Leave>", lambda e: self.chart.delete("hover"))
+
+        self.status = tk.Label(self.win, text="불러오는 중…", bg=BG, fg=FG_DIM, font=(FONT, 8), anchor="w", padx=12)
+        self.status.pack(fill="x", pady=(4, 6))
+
+        threading.Thread(target=self.worker, daemon=True).start()
+        self.win.after(150, self.drain)
+
+    # ---- 데이터 (백그라운드)
+    def worker(self):
+        key = (self.stock["type"], self.stock["code"])
+        last_chart = 0
+        while not self.stop.is_set():
+            try:
+                d = fetch_quotes([self.stock]).get(key)
+                if d:
+                    self.q.put(("quote", d))
+            except Exception:
+                self.q.put(("err", None))
+            if self.domestic:
+                try:
+                    self.q.put(("book", fetch_orderbook(self.stock["code"])))
+                except Exception:
+                    pass
+            # 차트는 15초마다 (1분봉이라 더 자주 받을 필요 없음 — 마지막 봉은 현재가로 실시간 갱신)
+            if self.chart_due or time.time() - last_chart > 15:
+                self.chart_due = False
+                mode = self.mode
+                try:
+                    self.q.put(("chart", (mode, fetch_chart(self.stock, mode))))
+                except Exception:
+                    pass
+                last_chart = time.time()
+            self.wake.wait(2)
+            self.wake.clear()
+
+    def drain(self):
+        if self.stop.is_set():
+            return
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "quote":
+                    self.on_quote(payload)
+                elif kind == "book":
+                    self.book = payload
+                    self.draw_book()
+                elif kind == "chart":
+                    mode, series = payload
+                    if mode == self.mode:
+                        self.series = series
+                        self.draw_chart()
+                else:
+                    self.status.config(text="연결 오류 · 재시도 중")
+        except queue.Empty:
+            pass
+        self.win.after(200, self.drain)
+
+    def on_quote(self, d):
+        self.quote = d
+        code = (d.get("compareToPreviousPrice") or {}).get("code", "3")
+        color = UP if code in UP_CODES else DOWN if code in DOWN_CODES else FLAT
+        arrow = "▲" if code in UP_CODES else "▼" if code in DOWN_CODES else "-"
+        sign = "+" if code in UP_CODES else "-" if code in DOWN_CODES else ""
+        diff = d.get("compareToPreviousClosePrice", "0").lstrip("-")
+        ratio = d.get("fluctuationsRatio", "0").lstrip("-")
+        set_if_changed(self.title, text=d.get("stockName") or self.stock.get("name", ""))
+        set_if_changed(self.price, text=d.get("closePrice", "-"), fg=color)
+        set_if_changed(self.change, text=f"{arrow} {diff}  {sign}{ratio}%", fg=color)
+        cur = to_num(d.get("closePrice"))
+        delta = to_num(diff) * (-1 if code in DOWN_CODES else 1)
+        self.prev_close = cur - delta
+        # 차트 마지막 봉을 현재가로 갱신해 차트도 실시간으로 움직이게
+        if self.series and self.mode == "minute":
+            lab, o, h, l, c, v = self.series[-1]
+            self.series[-1] = (lab, o, max(h, cur), min(l, cur), cur, v)
+            self.draw_chart()
+        status = "장중" if d.get("marketStatus") == "OPEN" else "장마감"
+        self.status.config(text=f'{status} · 업데이트 {datetime.now().strftime("%H:%M:%S")}'
+                                + ("" if self.domestic else "   ·   해외 종목은 일봉 차트만 제공되고 호가 정보는 없습니다"))
+
+    def set_mode(self, mode):
+        if mode == self.mode:
+            return
+        self.mode = mode
+        self.series = []
+        self._paint_mode_buttons()
+        self.draw_chart()
+        self.chart_due = True
+        self.wake.set()
+
+    def _paint_mode_buttons(self):
+        for k, b in self.mode_btns.items():
+            b.config(bg="#3a4252" if k == self.mode else BG_ROW, fg=FG if k == self.mode else FG_DIM)
+
+    def fmt(self, v):
+        return f"{v:,.0f}" if self.domestic else f"{v:,.2f}"
+
+    # ---- 차트
+    def draw_chart(self):
+        cv = self.chart
+        cv.delete("all")
+        W, H = cv.winfo_width(), cv.winfo_height()
+        if W < 50 or H < 50:
+            return
+        if not self.series:
+            cv.create_text(W / 2, H / 2, text="차트 불러오는 중…", fill=FG_DIM, font=(FONT, 9))
+            return
+        L, R, T, B = 8, 64, 12, 20                 # 여백 (오른쪽은 가격 눈금)
+        vol_h = (H - T - B) * 0.18                   # 아래쪽 거래량 영역
+        ph = H - T - B - vol_h - 6                   # 가격 영역 높이
+        pw = W - L - R
+        data = self.series
+        n = len(data)
+        lows = [r[3] for r in data]
+        highs = [r[2] for r in data]
+        lo, hi = min(lows), max(highs)
+        if self.mode == "minute" and self.prev_close:
+            lo, hi = min(lo, self.prev_close), max(hi, self.prev_close)
+        pad = (hi - lo) * 0.08 or hi * 0.01 or 1
+        lo, hi = lo - pad, hi + pad
+        y_of = lambda v: T + (hi - v) / (hi - lo) * ph
+        step = pw / max(n, 1)
+        x_of = lambda i: L + step * (i + 0.5)
+        self._geom = (L, step, n)
+
+        # 가격 눈금 + 가로 격자
+        for k in range(5):
+            v = lo + (hi - lo) * k / 4
+            y = y_of(v)
+            cv.create_line(L, y, L + pw, y, fill="#262a33")
+            cv.create_text(W - R + 6, y, text=self.fmt(v), anchor="w", fill=FG_DIM, font=(FONT, 8))
+        # 시간 눈금
+        for k in range(0, n, max(n // 5, 1)):
+            cv.create_text(x_of(k), H - B + 10, text=data[k][0], fill=FG_DIM, font=(FONT, 8),
+                           anchor="w" if k == 0 else "center")  # 첫 라벨이 왼쪽 끝에서 잘리지 않게
+
+        # 거래량 막대
+        vmax = max((r[5] for r in data), default=0) or 1
+        vb = T + ph + 6 + vol_h
+        for i, r in enumerate(data):
+            up = r[4] >= r[1]
+            vh = r[5] / vmax * vol_h
+            x = x_of(i)
+            cv.create_rectangle(x - max(step * 0.35, 0.5), vb - vh, x + max(step * 0.35, 0.5), vb,
+                                fill=mix(BG_ROW, UP if up else DOWN, 0.45), outline="")
+
+        if self.mode == "minute":
+            last = data[-1][4]
+            base = self.prev_close or data[0][1]
+            color = UP if last >= base else DOWN
+            pts = [(x_of(i), y_of(r[4])) for i, r in enumerate(data)]
+            if self.prev_close:   # 전일 종가 점선
+                yb = y_of(self.prev_close)
+                cv.create_line(L, yb, L + pw, yb, fill=FG_DIM, dash=(3, 3))
+                cv.create_text(L + 4, yb - 8, text=f"전일 {self.fmt(self.prev_close)}", anchor="w",
+                               fill=FG_DIM, font=(FONT, 7))
+            area = [(pts[0][0], T + ph)] + pts + [(pts[-1][0], T + ph)]
+            cv.create_polygon(*[c for p in area for c in p], fill=mix(BG_ROW, color, 0.18), outline="")
+            if len(pts) > 1:
+                cv.create_line(*[c for p in pts for c in p], fill=color, width=1.6)
+            cv.create_oval(pts[-1][0] - 3, pts[-1][1] - 3, pts[-1][0] + 3, pts[-1][1] + 3, fill=color, outline="")
+        else:
+            bw = max(step * 0.6, 1)
+            for i, (lab, o, h, l, c, v) in enumerate(data):
+                color = UP if c >= o else DOWN
+                x = x_of(i)
+                cv.create_line(x, y_of(h), x, y_of(l), fill=color)
+                y1, y2 = sorted((y_of(o), y_of(c)))
+                cv.create_rectangle(x - bw / 2, y1, x + bw / 2, max(y2, y1 + 1), fill=color, outline=color)
+        # 현재가 표시 (오른쪽 눈금 위)
+        last = data[-1][4]
+        yl = y_of(last)
+        lc = UP if (self.prev_close and last >= self.prev_close) else DOWN if self.prev_close else FLAT
+        cv.create_rectangle(W - R + 2, yl - 8, W - 2, yl + 8, fill=lc, outline="")
+        cv.create_text(W - R + 6, yl, text=self.fmt(last), anchor="w", fill="white", font=(FONT, 8, "bold"))
+
+    def on_hover(self, e):
+        cv = self.chart
+        cv.delete("hover")
+        if not self.series or not hasattr(self, "_geom"):
+            return
+        L, step, n = self._geom
+        i = int((e.x - L) // step)
+        if not 0 <= i < n:
+            return
+        lab, o, h, l, c, v = self.series[i]
+        x = L + step * (i + 0.5)
+        cv.create_line(x, 0, x, cv.winfo_height(), fill="#4a505c", dash=(2, 2), tags="hover")
+        if self.mode == "minute":
+            text = f"{lab}   {self.fmt(c)}   거래량 {v:,.0f}"
+        else:
+            text = f"{lab}   시 {self.fmt(o)}  고 {self.fmt(h)}  저 {self.fmt(l)}  종 {self.fmt(c)}   거래량 {v:,.0f}"
+        t = cv.create_text(10, 6, text=text, anchor="nw", fill=FG, font=(FONT, 8), tags="hover")
+        x0, y0, x1, y1 = cv.bbox(t)
+        bg = cv.create_rectangle(x0 - 4, y0 - 2, x1 + 4, y1 + 2, fill="#2c313c", outline="", tags="hover")
+        cv.tag_raise(t, bg)
+
+    # ---- 호가 (매도 5단계 위 · 매수 5단계 아래, 잔량 막대)
+    def draw_book(self):
+        if not self.domestic:
+            return
+        cv = self.book_cv
+        cv.delete("all")
+        W = self.BOOK_W
+        rh = self.ROW_H
+        cv.create_text(W * 0.18, 10, text="매도잔량", fill=FG_DIM, font=(FONT, 8))
+        cv.create_text(W * 0.5, 10, text="호가", fill=FG_DIM, font=(FONT, 8))
+        cv.create_text(W * 0.82, 10, text="매수잔량", fill=FG_DIM, font=(FONT, 8))
+        if not self.book:
+            cv.create_text(W / 2, 80, text="호가 불러오는 중…", fill=FG_DIM, font=(FONT, 9))
+            return
+        sells = self.book.get("sellInfo") or []
+        buys = self.book.get("buyInfos") or []
+        prev = self.book.get("lastClosePrice") or self.prev_close
+        cur = to_num(self.quote.get("closePrice")) if self.quote else None
+        y = 22
+        rows = [("sell", r) for r in sells] + [("buy", r) for r in buys]
+        for side, r in rows:
+            price = to_num(r["price"])
+            rate = min(max(r.get("rate") or 0, 0), 100) / 100
+            bg = mix(BG, DOWN, 0.10) if side == "sell" else mix(BG, UP, 0.10)
+            cv.create_rectangle(0, y, W, y + rh - 1, fill=bg, outline="")
+            pc = UP if prev and price > prev else DOWN if prev and price < prev else FG
+            if side == "sell":   # 매도 잔량은 왼쪽 칸에 오른쪽→왼쪽 막대
+                bw = W * 0.34 * rate
+                cv.create_rectangle(W * 0.34 - bw, y + 4, W * 0.34, y + rh - 5, fill=mix(BG, DOWN, 0.45), outline="")
+                cv.create_text(W * 0.32, y + rh / 2, text=r["count"], anchor="e", fill=FG, font=(FONT, 8))
+            else:                # 매수 잔량은 오른쪽 칸에 왼쪽→오른쪽 막대
+                bw = W * 0.34 * rate
+                cv.create_rectangle(W * 0.66, y + 4, W * 0.66 + bw, y + rh - 5, fill=mix(BG, UP, 0.45), outline="")
+                cv.create_text(W * 0.68, y + rh / 2, text=r["count"], anchor="w", fill=FG, font=(FONT, 8))
+            cv.create_text(W * 0.5, y + rh / 2, text=r["price"], fill=pc, font=(FONT, 9, "bold"))
+            if cur and abs(price - cur) < 1e-9:  # 현재가 칸 테두리
+                cv.create_rectangle(W * 0.34 + 1, y + 1, W * 0.66 - 1, y + rh - 2, outline=FG)
+            y += rh
+            if side == "sell" and r is sells[-1]:
+                cv.create_line(0, y, W, y, fill="#4a505c")
+        y += 6
+        cv.create_text(W * 0.18, y + 8, text=self.book.get("totalSell", "-"), fill=DOWN, font=(FONT, 8, "bold"))
+        cv.create_text(W * 0.5, y + 8, text="총잔량", fill=FG_DIM, font=(FONT, 8))
+        cv.create_text(W * 0.82, y + 8, text=self.book.get("totalBuy", "-"), fill=UP, font=(FONT, 8, "bold"))
+
+    def close(self):
+        self.stop.set()
+        self.wake.set()
+        self.win.destroy()
 
 
 if __name__ == "__main__":
