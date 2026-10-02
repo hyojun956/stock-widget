@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 GITHUB_REPO = "hyojun956/stock-widget"   # 업데이트를 받아올 저장소 (release.ps1 로 배포)
 # API 대신 릴리스 첨부파일 직접 링크 사용 → 사무실 전체가 같은 IP여도 GitHub API 호출 제한(시간당 60회)에 안 걸림
 RELEASE_BASE = f"https://github.com/{GITHUB_REPO}/releases/latest/download/"
@@ -42,6 +42,8 @@ DEFAULT_CONFIG = {
     "alpha": 0.92,
     "topmost": True,
     "interval": 3,
+    "win_w": None,   # 수동으로 크기 조절하면 채워짐 (None이면 자동 맞춤)
+    "win_h": None,
     "stocks": [
         {"code": "005930", "type": "domestic", "name": "삼성전자"},
     ],
@@ -85,6 +87,28 @@ def set_if_changed(widget, **kw):
     diff = {k: v for k, v in kw.items() if str(widget.cget(k)) != str(v)}
     if diff:
         widget.config(**diff)
+
+
+def set_crisp_icon(window, path=ICON_PATH):
+    """tkinter의 iconbitmap/iconphoto는 작은 비트맵 하나만 뽑아 확대 표시해 흐릿해지므로,
+    현재 DPI 배율에 맞는 크기를 ico에서 직접 골라 taskbar/Alt-Tab 아이콘으로 지정한다.
+    (-alpha 속성을 쓰는 Tk 창은 내부적으로 래퍼 HWND를 하나 더 두므로 GetParent로 찾아야 함)"""
+    try:
+        import ctypes
+        window.update_idletasks()
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(window.winfo_id()) or window.winfo_id()
+        IMAGE_ICON, LR_LOADFROMFILE, WM_SETICON = 1, 0x10, 0x80
+        big = user32.GetSystemMetrics(11)    # SM_CXICON
+        small = user32.GetSystemMetrics(49)  # SM_CXSMICON
+        h_big = user32.LoadImageW(0, path, IMAGE_ICON, big, big, LR_LOADFROMFILE)
+        h_small = user32.LoadImageW(0, path, IMAGE_ICON, small, small, LR_LOADFROMFILE)
+        if h_big:
+            user32.SendMessageW(hwnd, WM_SETICON, 1, h_big)
+        if h_small:
+            user32.SendMessageW(hwnd, WM_SETICON, 0, h_small)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- data
@@ -272,6 +296,7 @@ class StockWidget:
             self.root.iconbitmap(default=ICON_PATH)
         except tk.TclError:
             pass
+        set_crisp_icon(self.root)
         self.root.overrideredirect(True)
         self.root.configure(bg=BG)
         self.root.attributes("-topmost", self.cfg["topmost"])
@@ -315,10 +340,30 @@ class StockWidget:
         self.slider.bind("<MouseWheel>", lambda e: self.set_alpha(self.cfg["alpha"] + (0.05 if e.delta > 0 else -0.05)))
         self.draw_slider()
 
-        self.body = tk.Frame(self.outer, bg=BG, width=270)
-        self.body.pack(fill="both", expand=True)
+        # 종목 목록: 캔버스 + 세로 스크롤바 (4개 이상이면 자동으로 스크롤 영역으로 전환)
+        self.body_area = tk.Frame(self.outer, bg=BG)
+        self.body_area.pack(fill="both", expand=True)
+        self.body_canvas = tk.Canvas(self.body_area, bg=BG, highlightthickness=0, width=270)
+        self.body_canvas.pack(side="left", fill="both", expand=True)
+        self.body_scroll = tk.Scrollbar(self.body_area, orient="vertical", command=self.body_canvas.yview)
+        self.body = tk.Frame(self.body_canvas, bg=BG)
+        self._body_window = self.body_canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.body_canvas.configure(yscrollcommand=self.body_scroll.set)
+        self.body_canvas.bind("<Configure>", self._on_canvas_configure)
+        self.body.bind("<Configure>", self._on_body_configure)
+        self.body_canvas.bind("<MouseWheel>", self._on_wheel)
+        self.body.bind("<MouseWheel>", self._on_wheel)
 
-        for w in (self.outer, self.header, self.dot, self.clock, self.body):
+        # 오른쪽 아래 크기 조절 손잡이
+        self.grip = tk.Label(self.outer, text="⋰", bg=BG, fg=FG_DIM, font=(FONT, 10), cursor="size_nw_se")
+        self.grip.place(relx=1.0, rely=1.0, anchor="se", x=-1, y=-1)
+        self.grip.bind("<ButtonPress-1>", self.grip_start)
+        self.grip.bind("<B1-Motion>", self.grip_drag)
+        self.grip.bind("<ButtonRelease-1>", self.grip_end)
+        self.grip.bind("<Enter>", lambda e: self.grip.config(fg=FG))
+        self.grip.bind("<Leave>", lambda e: self.grip.config(fg=FG_DIM))
+
+        for w in (self.outer, self.header, self.dot, self.clock, self.body, self.body_canvas):
             self._bind_common(w)
 
         # 새 버전이 있을 때만 나타나는 알림 바
@@ -435,6 +480,57 @@ class StockWidget:
         self.root.attributes("-topmost", self.cfg["topmost"])
         self.save_config()
 
+    # ---- 종목 목록 스크롤 / 창 크기 조절
+    def _on_canvas_configure(self, e):
+        self.body_canvas.itemconfig(self._body_window, width=e.width)
+
+    def _on_body_configure(self, e):
+        self.body_canvas.configure(scrollregion=self.body_canvas.bbox("all"))
+
+    def _on_wheel(self, e):
+        if self.body_scroll.winfo_ismapped():
+            self.body_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        return "break"
+
+    def _show_scrollbar(self, show):
+        if show and not self.body_scroll.winfo_ismapped():
+            self.body_scroll.pack(side="right", fill="y")
+        elif not show and self.body_scroll.winfo_ismapped():
+            self.body_scroll.pack_forget()
+
+    def relayout_body(self):
+        """종목이 4개 이상이면 기본적으로 3개 높이만 보여주고 스크롤, 그 전에는 꽉 차게 자동 맞춤.
+        사용자가 손잡이로 직접 크기를 조절했으면(win_w/win_h) 그 값을 그대로 우선한다."""
+        self.body.update_idletasks()
+        content_h = max(self.body.winfo_reqheight(), 1)
+        rows = max(len(self.rows), 1)
+        if self.cfg.get("win_h"):
+            canvas_h = self.cfg["win_h"]
+        elif rows >= 4:
+            canvas_h = max(int(content_h * 3 / rows), 1)
+        else:
+            canvas_h = content_h
+        canvas_w = self.cfg.get("win_w") or 270
+        set_if_changed(self.body_canvas, height=canvas_h, width=canvas_w)
+        self._show_scrollbar(content_h > canvas_h + 1)
+
+    def grip_start(self, e):
+        self._grip = (e.x_root, e.y_root, self.body_canvas.winfo_width(), self.body_canvas.winfo_height())
+
+    def grip_drag(self, e):
+        x0, y0, w0, h0 = self._grip
+        w = max(270, w0 + (e.x_root - x0))
+        h = max(30, h0 + (e.y_root - y0))
+        self.cfg["win_w"], self.cfg["win_h"] = w, h
+        self.body_canvas.configure(width=w, height=h)
+        self.body.update_idletasks()
+        self._show_scrollbar(self.body.winfo_reqheight() > h + 1)
+        return "break"
+
+    def grip_end(self, e):
+        self.save_config()
+        return "break"
+
     # ---- 종목 관리
     def build_rows(self):
         for r in self.rows:
@@ -449,6 +545,7 @@ class StockWidget:
             lbl.pack()
             self._bind_common(lbl)
             self._empty = lbl
+            self.relayout_body()
             return
         for s in self.cfg["stocks"]:
             row = StockRow(self.body, s)
@@ -456,7 +553,9 @@ class StockWidget:
             row.bind_all("<B1-Motion>", self.on_drag)
             row.bind_all("<ButtonRelease-1>", lambda e: self.save_config())
             row.bind_all("<Button-3>", self.show_menu)
+            row.bind_all("<MouseWheel>", self._on_wheel)
             self.rows.append(row)
+        self.relayout_body()
         self.wake.set()
 
     def set_stocks(self, stocks):
@@ -526,7 +625,7 @@ class StockWidget:
             # 새 버전이 있으면 묻지 않고 바로 받아서 교체·재시작
             self.update_info = info
             if not self.update_bar.winfo_ismapped():
-                self.update_bar.pack(fill="x", pady=(0, 2), before=self.body)
+                self.update_bar.pack(fill="x", pady=(0, 2), before=self.body_area)
             self.do_update()
         elif manual:
             set_if_changed(self.clock, text=f"최신 버전입니다 (v{APP_VERSION})")
@@ -590,6 +689,7 @@ class EditDialog:
         self.win.title("종목 목록 편집")
         self.win.attributes("-topmost", True)
         self.win.resizable(False, False)
+        set_crisp_icon(self.win)
         # 위젯 옆에 띄우기 (왼쪽 공간이 있으면 왼쪽, 아니면 오른쪽)
         mx, my = master.winfo_x(), master.winfo_y()
         sx = mx - 380 if mx - 380 > master.winfo_vrootx() else mx + master.winfo_width() + 8
