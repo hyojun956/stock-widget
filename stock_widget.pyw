@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 GITHUB_REPO = "hyojun956/stock-widget"   # 업데이트를 받아올 저장소 (release.ps1 로 배포)
 # API 대신 릴리스 첨부파일 직접 링크 사용 → 사무실 전체가 같은 IP여도 GitHub API 호출 제한(시간당 60회)에 안 걸림
 RELEASE_BASE = f"https://github.com/{GITHUB_REPO}/releases/latest/download/"
